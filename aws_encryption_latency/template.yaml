@@ -1,0 +1,174 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  TrustedPrincipal:
+    Type: String
+    Description: ARN allowed to assume the role
+
+  KeyAdminArn:
+    Type: String
+    Description: ARN of IAM user/role that can administer this key
+    
+  LambdaCodeBucketName:
+    Type: String
+    Description: Name of S3 bucket containing the Lambda function code
+    Default: "pqc-code-bucket"
+  
+  LambdaCodeVersion:
+    Type: String
+    Description: S3 Object Version of the Lambda function code zip file
+    Default: "latest"
+  
+  LambdaMemorySize:
+    Type: Number
+    Description: Memory size for the Lambda function in MB
+    Default: 512
+
+Resources:
+  KeyUsageRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref TrustedPrincipal
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: AllowUseOfMldsA44Key
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource: "*"
+
+  EncryptionLatencyFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: AllowLogsAndKmsSignVerify
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - kms:Sign
+                  - kms:Verify
+                  - kms:GetPublicKey
+                  - kms:DescribeKey
+                Resource: 
+                  - "*"
+
+  EncryptionLatencyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: "nodejs22.x"
+      Handler: "app.handler"
+      Role: !GetAtt EncryptionLatencyFunctionRole.Arn
+      Timeout: 900
+      MemorySize: !Ref LambdaMemorySize
+      Code:
+        S3Bucket: !Ref LambdaCodeBucketName
+        S3Key: "test-aws-encryption-latency/function.zip"
+        S3ObjectVersion: !Ref LambdaCodeVersion
+      Environment:
+        Variables:
+          RSA_2048_ARN: !GetAtt RSA2048Key.Arn
+          ITERATIONS: "100"
+          RUN_SIZE_ITERATIONS: "true"
+  
+  InvokeFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: "NONE"
+      TargetFunctionArn: !GetAtt EncryptionLatencyFunction.Arn
+
+  InvokeFunctionUrlPermissionPublic:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EncryptionLatencyFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  InvokeFunctionPermissionPublic:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EncryptionLatencyFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+
+  RSA2048Key:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      EnableKeyRotation: false
+      PendingWindowInDays: 7
+      KeyUsage: ENCRYPT_DECRYPT
+      KeySpec: RSA_2048
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRootAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: "kms:*"
+            Resource: "*"
+
+          - Sid: AllowKeyAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Ref KeyAdminArn
+            Action: "kms:*"
+            Resource: "*"
+
+          - Sid: AllowRoleUse
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt KeyUsageRole.Arn
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+
+          - Sid: AllowLambdaUse
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt EncryptionLatencyFunctionRole.Arn
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:GetPublicKey
+              - kms:DescribeKey
+            Resource: "*"
+
+Outputs:
+  FunctionUrl:
+    Value: !GetAtt InvokeFunctionUrl.FunctionUrl
